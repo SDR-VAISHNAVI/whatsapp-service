@@ -1,10 +1,12 @@
-const { Client, LocalAuth } = require('whatsapp-web.js');
+const { Client, RemoteAuth } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
 const QRCode = require('qrcode');
 const express = require('express');
 const path = require('path');
 const fs = require('fs');
 const { execSync } = require('child_process');
+const { createClient } = require('@supabase/supabase-js');
+const SupabaseStore = require('./SupabaseStore');
 
 const app = express();
 app.use(express.json());
@@ -15,96 +17,68 @@ let clientReady = false;
 let currentQR = null;
 
 // ==============================
+// SUPABASE
+// ==============================
+
+const supabase = createClient(
+    process.env.SUPABASE_URL,
+    process.env.SUPABASE_SERVICE_KEY
+);
+
+// ==============================
 // CHROME PATH RESOLUTION
 // ==============================
 
 function findChrome() {
     console.log('--- Chrome Discovery ---');
-    console.log('__dirname:', __dirname);
-    console.log('HOME:', process.env.HOME);
-    console.log('PUPPETEER_EXECUTABLE_PATH env:', process.env.PUPPETEER_EXECUTABLE_PATH || '(not set)');
-
-    // Log everything we can find
-    try {
-        const allChrome = execSync('find / -name "chrome" -type f 2>/dev/null | grep -v proc | head -20').toString().trim();
-        console.log('All chrome binaries found:\n', allChrome || '(none)');
-    } catch (_) {}
-
-    try {
-        const cacheContents = execSync('find /opt/render -type d -name "puppeteer" 2>/dev/null').toString().trim();
-        console.log('Puppeteer dirs under /opt/render:\n', cacheContents || '(none)');
-    } catch (_) {}
-
-    try {
-        const projectCache = execSync(`find "${__dirname}" -type d -name "chrome*" 2>/dev/null | head -5`).toString().trim();
-        console.log('Chrome dirs in project:\n', projectCache || '(none)');
-    } catch (_) {}
-
-    // 1. Explicit env var — but VERIFY the file actually exists first
     if (process.env.PUPPETEER_EXECUTABLE_PATH) {
         const envPath = process.env.PUPPETEER_EXECUTABLE_PATH;
         if (fs.existsSync(envPath)) {
-            console.log('✅ Using verified env path:', envPath);
+            console.log('✅ Using env path:', envPath);
             return envPath;
-        } else {
-            console.warn('⚠️  Env var path does NOT exist on disk:', envPath, '— ignoring it');
         }
     }
-
-    // 2. Project-local cache (where `npx puppeteer browsers install chrome` puts it
-    //    when run from the project dir during build)
     const projectCacheDirs = [
         path.join(__dirname, '.cache', 'puppeteer'),
         path.join(__dirname, 'node_modules', 'puppeteer', '.local-chromium'),
-        path.join(__dirname, 'node_modules', 'puppeteer-core', '.local-chromium'),
     ];
     for (const dir of projectCacheDirs) {
         if (fs.existsSync(dir)) {
             try {
                 const found = execSync(`find "${dir}" -name "chrome" -type f 2>/dev/null | head -1`).toString().trim();
-                if (found) { console.log('✅ Found in project cache:', found); return found; }
+                if (found) return found;
             } catch (_) {}
         }
     }
-
-    // 3. Broad search under the project root
     try {
         const found = execSync(`find "${__dirname}" -name "chrome" -type f 2>/dev/null | head -1`).toString().trim();
-        if (found) { console.log('✅ Found under project root:', found); return found; }
+        if (found) return found;
     } catch (_) {}
-
-    // 4. HOME cache
-    const home = process.env.HOME || '/root';
     try {
-        const found = execSync(`find "${home}" -name "chrome" -type f 2>/dev/null | head -1`).toString().trim();
-        if (found) { console.log('✅ Found under HOME:', found); return found; }
+        const sys = execSync('which google-chrome-stable google-chrome chromium 2>/dev/null | head -1').toString().trim();
+        if (sys) return sys;
     } catch (_) {}
-
-    // 5. System chrome
-    try {
-        const sys = execSync('which google-chrome-stable google-chrome chromium-browser chromium 2>/dev/null | head -1').toString().trim();
-        if (sys) { console.log('✅ System Chrome:', sys); return sys; }
-    } catch (_) {}
-
-    console.error('❌ Chrome not found anywhere. Build command may not be persisting files.');
     return null;
+}
+
+const chromePath = findChrome();
+if (!chromePath) {
+    console.error('FATAL: No Chrome binary found.');
+    process.exit(1);
 }
 
 // ==============================
 // WHATSAPP CLIENT
 // ==============================
 
-const chromePath = findChrome();
-console.log('--- Using Chrome:', chromePath, '---');
-
-if (!chromePath) {
-    console.error('FATAL: No Chrome binary found. Cannot start WhatsApp client.');
-    console.error('Fix: make sure your Render build command is: npm install && npx puppeteer browsers install chrome');
-    process.exit(1);
-}
+const store = new SupabaseStore(supabase);
 
 const client = new Client({
-    authStrategy: new LocalAuth(),
+    authStrategy: new RemoteAuth({
+        clientId: 'dojo-whatsapp',
+        store,
+        backupSyncIntervalMs: 300000
+    }),
     puppeteer: {
         headless: true,
         executablePath: chromePath,
@@ -143,8 +117,12 @@ client.on('auth_failure', () => {
     clientReady = false;
 });
 
+client.on('remote_session_saved', () => {
+    console.log('✅ Session saved to Supabase!');
+});
+
 client.on('disconnected', () => {
-    console.log('⚠️ WhatsApp disconnected! Reinitializing...');
+    console.log('⚠️ Disconnected! Reinitializing...');
     clientReady = false;
     client.initialize();
 });
@@ -159,8 +137,7 @@ client.initialize();
 app.get('/', (req, res) => {
     res.json({
         status: clientReady ? 'ready' : 'waiting',
-        message: clientReady ? '✅ WhatsApp connected!' : '⏳ Waiting for QR scan...',
-        chromePath
+        message: clientReady ? '✅ WhatsApp connected!' : '⏳ Waiting for QR scan...'
     });
 });
 
@@ -177,7 +154,7 @@ app.get('/qr', (req, res) => {
         return res.send(`
             <html><body style="background:#111;color:#fff;font-family:sans-serif;text-align:center;padding:40px;">
                 <h2>⏳ Generating QR Code...</h2>
-                <p>Please wait and refresh this page in 10 seconds.</p>
+                <p>Please wait and refresh in 10 seconds.</p>
                 <script>setTimeout(() => location.reload(), 5000);</script>
             </body></html>
         `);
@@ -197,21 +174,15 @@ app.post('/send-absence', async (req, res) => {
     if (!clientReady) {
         return res.status(503).json({ error: 'WhatsApp not connected yet. Please scan QR first.' });
     }
-
     const { students, date } = req.body;
-
     if (!students || !students.length) {
         return res.json({ success: true, sent: 0, message: 'No absent students' });
     }
-
     const results = [];
-
     for (const student of students) {
         if (!student.phone_number) continue;
-
         const phone = String(student.phone_number).replace(/[^0-9]/g, '');
         const number = phone + '@c.us';
-
         const message =
 `🥋 *Dojo Attendance Alert*
 
@@ -222,7 +193,6 @@ Please ensure regular attendance to maintain progress.
 
 Regards,
 Dojo Management 🥋`;
-
         try {
             await client.sendMessage(number, message);
             console.log(`✅ Sent to ${student.name} (${phone})`);
@@ -233,7 +203,6 @@ Dojo Management 🥋`;
             results.push({ name: student.name, status: 'failed', error: err.message });
         }
     }
-
     res.json({
         success: true,
         sent: results.filter(r => r.status === 'sent').length,
@@ -244,5 +213,4 @@ Dojo Management 🥋`;
 
 app.listen(PORT, () => {
     console.log(`🌐 WhatsApp service running on port ${PORT}`);
-    console.log(`📱 Open /qr to scan QR code`);
 });
