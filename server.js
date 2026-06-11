@@ -2,6 +2,8 @@ const { Client, LocalAuth } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
 const QRCode = require('qrcode');
 const express = require('express');
+const path = require('path');
+const fs = require('fs');
 
 const app = express();
 app.use(express.json());
@@ -12,37 +14,75 @@ let clientReady = false;
 let currentQR = null;
 
 // ==============================
-// WHATSAPP CLIENT
+// CHROME PATH RESOLUTION
 // ==============================
 const { execSync } = require('child_process');
 
 function findChrome() {
-    // 1. Environment variable (set this in Render dashboard if needed)
+    // 1. Explicit env var override (set in Render dashboard if needed)
     if (process.env.PUPPETEER_EXECUTABLE_PATH) {
+        console.log('✅ Chrome from env:', process.env.PUPPETEER_EXECUTABLE_PATH);
         return process.env.PUPPETEER_EXECUTABLE_PATH;
     }
-    // 2. Search Render's puppeteer cache for any chrome binary
+
+    // 2. Search relative to the project directory first (where 'npm run build' installs it)
+    //    Render sets __dirname to /opt/render/project/src
+    const projectCacheDir = path.join(__dirname, '.cache', 'puppeteer');
+    console.log('🔍 Searching project cache:', projectCacheDir);
+    if (fs.existsSync(projectCacheDir)) {
+        try {
+            const found = execSync(
+                `find "${projectCacheDir}" -name "chrome" -type f 2>/dev/null | head -1`
+            ).toString().trim();
+            if (found) { console.log('✅ Chrome found at:', found); return found; }
+        } catch (_) {}
+    }
+
+    // 3. Search Render's HOME cache directory
+    const homeCacheDir = path.join(process.env.HOME || '/opt/render', '.cache', 'puppeteer');
+    console.log('🔍 Searching home cache:', homeCacheDir);
+    if (fs.existsSync(homeCacheDir)) {
+        try {
+            const found = execSync(
+                `find "${homeCacheDir}" -name "chrome" -type f 2>/dev/null | head -1`
+            ).toString().trim();
+            if (found) { console.log('✅ Chrome found at:', found); return found; }
+        } catch (_) {}
+    }
+
+    // 4. Broad search under /opt/render (catches any variation)
+    console.log('🔍 Broad search under /opt/render...');
     try {
-        const found = execSync('find /opt/render/.cache/puppeteer -name "chrome" -type f 2>/dev/null | head -1')
-            .toString().trim();
+        const found = execSync(
+            `find /opt/render -name "chrome" -type f 2>/dev/null | head -1`
+        ).toString().trim();
         if (found) { console.log('✅ Chrome found at:', found); return found; }
     } catch (_) {}
-    // 3. System chrome
+
+    // 5. System-installed Chrome fallback
     try {
-        const sys = execSync('which google-chrome chromium-browser chromium 2>/dev/null | head -1')
-            .toString().trim();
+        const sys = execSync(
+            'which google-chrome-stable google-chrome chromium-browser chromium 2>/dev/null | head -1'
+        ).toString().trim();
         if (sys) { console.log('✅ System Chrome at:', sys); return sys; }
     } catch (_) {}
 
-    console.error('❌ No Chrome found! Run: npx puppeteer browsers install chrome');
+    console.error('❌ No Chrome found! Make sure your build command includes: npx puppeteer browsers install chrome');
     return null;
 }
+
+// ==============================
+// WHATSAPP CLIENT
+// ==============================
+
+const chromePath = findChrome();
+console.log('🌐 Using Chrome executable:', chromePath);
 
 const client = new Client({
     authStrategy: new LocalAuth(),
     puppeteer: {
         headless: true,
-        executablePath: findChrome(),
+        executablePath: chromePath,
         args: [
             '--no-sandbox',
             '--disable-setuid-sandbox',
@@ -59,7 +99,6 @@ const client = new Client({
 client.on('qr', async (qr) => {
     console.log('\n📱 New QR Code generated!');
     qrcode.generate(qr, { small: true });
-    // Store QR as base64 image for web display
     try {
         currentQR = await QRCode.toDataURL(qr);
         console.log('QR available at /qr endpoint');
@@ -137,7 +176,6 @@ app.post('/send-absence', async (req, res) => {
     }
 
     const { students, date } = req.body;
-    // students = [{ name: "John", phone_number: "919876543210" }, ...]
 
     if (!students || !students.length) {
         return res.json({ success: true, sent: 0, message: 'No absent students' });
@@ -148,11 +186,11 @@ app.post('/send-absence', async (req, res) => {
     for (const student of students) {
         if (!student.phone_number) continue;
 
-        // Clean phone number - remove +, spaces, dashes
+        // Clean phone number — remove +, spaces, dashes
         const phone = String(student.phone_number).replace(/[^0-9]/g, '');
         const number = phone + '@c.us';
 
-        const message = 
+        const message =
 `🥋 *Dojo Attendance Alert*
 
 Dear Parent,
