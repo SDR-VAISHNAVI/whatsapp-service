@@ -1,134 +1,138 @@
-const { Client, RemoteAuth } = require('whatsapp-web.js');
-const qrcode = require('qrcode-terminal');
-const QRCode = require('qrcode');
 const express = require('express');
-const path = require('path');
-const fs = require('fs');
-const { execSync } = require('child_process');
+const QRCode = require('qrcode');
 const { createClient } = require('@supabase/supabase-js');
-const SupabaseStore = require('./SupabaseStore');
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
+const { Boom } = require('@hapi/boom');
+const fs = require('fs');
+const path = require('path');
+const pino = require('pino');
 
 const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
-
-let clientReady = false;
-let currentQR = null;
-
-// ==============================
-// SUPABASE
-// ==============================
-
 const supabase = createClient(
     process.env.SUPABASE_URL,
     process.env.SUPABASE_SERVICE_KEY
 );
 
+let sock = null;
+let clientReady = false;
+let currentQR = null;
+
 // ==============================
-// CHROME PATH RESOLUTION
+// SUPABASE SESSION STORE
 // ==============================
 
-function findChrome() {
-    console.log('--- Chrome Discovery ---');
-    if (process.env.PUPPETEER_EXECUTABLE_PATH) {
-        const envPath = process.env.PUPPETEER_EXECUTABLE_PATH;
-        if (fs.existsSync(envPath)) {
-            console.log('✅ Using env path:', envPath);
-            return envPath;
+const SESSION_DIR = '/tmp/whatsapp-session';
+
+async function loadSessionFromSupabase() {
+    try {
+        const { data, error } = await supabase
+            .from('whatsapp_sessions')
+            .select('session')
+            .eq('id', 'dojo-whatsapp')
+            .single();
+        if (error || !data) {
+            console.log('No session found in Supabase, starting fresh');
+            return;
         }
-    }
-    const projectCacheDirs = [
-        path.join(__dirname, '.cache', 'puppeteer'),
-        path.join(__dirname, 'node_modules', 'puppeteer', '.local-chromium'),
-    ];
-    for (const dir of projectCacheDirs) {
-        if (fs.existsSync(dir)) {
-            try {
-                const found = execSync(`find "${dir}" -name "chrome" -type f 2>/dev/null | head -1`).toString().trim();
-                if (found) return found;
-            } catch (_) {}
+        fs.mkdirSync(SESSION_DIR, { recursive: true });
+        const sessionData = JSON.parse(data.session);
+        for (const [filename, content] of Object.entries(sessionData)) {
+            fs.writeFileSync(
+                path.join(SESSION_DIR, filename),
+                JSON.stringify(content)
+            );
         }
-    }
-    try {
-        const found = execSync(`find "${__dirname}" -name "chrome" -type f 2>/dev/null | head -1`).toString().trim();
-        if (found) return found;
-    } catch (_) {}
-    try {
-        const sys = execSync('which google-chrome-stable google-chrome chromium 2>/dev/null | head -1').toString().trim();
-        if (sys) return sys;
-    } catch (_) {}
-    return null;
-}
-
-const chromePath = findChrome();
-if (!chromePath) {
-    console.error('FATAL: No Chrome binary found.');
-    process.exit(1);
-}
-
-// ==============================
-// WHATSAPP CLIENT
-// ==============================
-
-const store = new SupabaseStore(supabase);
-
-const client = new Client({
-    authStrategy: new RemoteAuth({
-        clientId: 'dojo-whatsapp',
-        store,
-        backupSyncIntervalMs: 300000
-    }),
-    puppeteer: {
-        headless: true,
-        executablePath: chromePath,
-        args: [
-            '--no-sandbox',
-            '--disable-setuid-sandbox',
-            '--disable-dev-shm-usage',
-            '--disable-accelerated-2d-canvas',
-            '--no-first-run',
-            '--no-zygote',
-            '--single-process',
-            '--disable-gpu'
-        ]
-    }
-});
-
-client.on('qr', async (qr) => {
-    console.log('\n📱 New QR Code generated!');
-    qrcode.generate(qr, { small: true });
-    try {
-        currentQR = await QRCode.toDataURL(qr);
-        console.log('QR available at /qr endpoint');
+        console.log('✅ Session loaded from Supabase');
     } catch (e) {
-        console.error('QR generation error:', e);
+        console.error('Error loading session:', e);
     }
-});
+}
 
-client.on('ready', () => {
-    console.log('✅ WhatsApp client is ready!');
-    clientReady = true;
-    currentQR = null;
-});
+async function saveSessionToSupabase() {
+    try {
+        if (!fs.existsSync(SESSION_DIR)) return;
+        const files = fs.readdirSync(SESSION_DIR);
+        const sessionData = {};
+        for (const file of files) {
+            const content = fs.readFileSync(path.join(SESSION_DIR, file), 'utf8');
+            try { sessionData[file] = JSON.parse(content); }
+            catch { sessionData[file] = content; }
+        }
+        const { error } = await supabase
+            .from('whatsapp_sessions')
+            .upsert({
+                id: 'dojo-whatsapp',
+                session: JSON.stringify(sessionData),
+                updated_at: new Date().toISOString()
+            });
+        if (error) throw error;
+        console.log('✅ Session saved to Supabase');
+    } catch (e) {
+        console.error('Error saving session:', e);
+    }
+}
 
-client.on('auth_failure', () => {
-    console.error('❌ Auth failed!');
-    clientReady = false;
-});
+// ==============================
+// WHATSAPP CONNECTION
+// ==============================
 
-client.on('remote_session_saved', () => {
-    console.log('✅ Session saved to Supabase!');
-});
+async function connectWhatsApp() {
+    await loadSessionFromSupabase();
+    fs.mkdirSync(SESSION_DIR, { recursive: true });
 
-client.on('disconnected', () => {
-    console.log('⚠️ Disconnected! Reinitializing...');
-    clientReady = false;
-    client.initialize();
-});
+    const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
 
-console.log('🚀 Initializing WhatsApp client...');
-client.initialize();
+    sock = makeWASocket({
+        auth: state,
+        printQRInTerminal: true,
+        logger: pino({ level: 'silent' }),
+    });
+
+    sock.ev.on('creds.update', async () => {
+        await saveCreds();
+        await saveSessionToSupabase();
+    });
+
+    sock.ev.on('connection.update', async (update) => {
+        const { connection, lastDisconnect, qr } = update;
+
+        if (qr) {
+            console.log('📱 New QR generated');
+            currentQR = await QRCode.toDataURL(qr);
+            clientReady = false;
+        }
+
+        if (connection === 'open') {
+            console.log('✅ WhatsApp connected!');
+            clientReady = true;
+            currentQR = null;
+            await saveSessionToSupabase();
+        }
+
+        if (connection === 'close') {
+            clientReady = false;
+            const shouldReconnect =
+                lastDisconnect?.error instanceof Boom &&
+                lastDisconnect.error.output?.statusCode !== DisconnectReason.loggedOut;
+
+            console.log('⚠️ Connection closed. Reconnecting:', shouldReconnect);
+            if (shouldReconnect) {
+                setTimeout(connectWhatsApp, 5000);
+            } else {
+                console.log('Logged out — clearing session');
+                await supabase
+                    .from('whatsapp_sessions')
+                    .delete()
+                    .eq('id', 'dojo-whatsapp');
+                currentQR = null;
+                setTimeout(connectWhatsApp, 5000);
+            }
+        }
+    });
+}
 
 // ==============================
 // ROUTES
@@ -182,7 +186,10 @@ app.post('/send-absence', async (req, res) => {
     for (const student of students) {
         if (!student.phone_number) continue;
         const phone = String(student.phone_number).replace(/[^0-9]/g, '');
-        const number = phone + '@c.us';
+        // Baileys format: countrycode+number@s.whatsapp.net
+        const number = phone.startsWith('91') ? phone : '91' + phone;
+        const jid = number + '@s.whatsapp.net';
+
         const message =
 `🥋 *Dojo Attendance Alert*
 
@@ -193,8 +200,9 @@ Please ensure regular attendance to maintain progress.
 
 Regards,
 Dojo Management 🥋`;
+
         try {
-            await client.sendMessage(number, message);
+            await sock.sendMessage(jid, { text: message });
             console.log(`✅ Sent to ${student.name} (${phone})`);
             results.push({ name: student.name, status: 'sent' });
             await new Promise(r => setTimeout(r, 1000));
@@ -210,6 +218,12 @@ Dojo Management 🥋`;
         results
     });
 });
+
+// ==============================
+// START
+// ==============================
+
+connectWhatsApp();
 
 app.listen(PORT, () => {
     console.log(`🌐 WhatsApp service running on port ${PORT}`);
