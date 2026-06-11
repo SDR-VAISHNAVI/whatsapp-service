@@ -4,6 +4,7 @@ const QRCode = require('qrcode');
 const express = require('express');
 const path = require('path');
 const fs = require('fs');
+const { execSync } = require('child_process');
 
 const app = express();
 app.use(express.json());
@@ -16,58 +17,76 @@ let currentQR = null;
 // ==============================
 // CHROME PATH RESOLUTION
 // ==============================
-const { execSync } = require('child_process');
 
 function findChrome() {
-    // 1. Explicit env var override (set in Render dashboard if needed)
+    console.log('--- Chrome Discovery ---');
+    console.log('__dirname:', __dirname);
+    console.log('HOME:', process.env.HOME);
+    console.log('PUPPETEER_EXECUTABLE_PATH env:', process.env.PUPPETEER_EXECUTABLE_PATH || '(not set)');
+
+    // Log everything we can find
+    try {
+        const allChrome = execSync('find / -name "chrome" -type f 2>/dev/null | grep -v proc | head -20').toString().trim();
+        console.log('All chrome binaries found:\n', allChrome || '(none)');
+    } catch (_) {}
+
+    try {
+        const cacheContents = execSync('find /opt/render -type d -name "puppeteer" 2>/dev/null').toString().trim();
+        console.log('Puppeteer dirs under /opt/render:\n', cacheContents || '(none)');
+    } catch (_) {}
+
+    try {
+        const projectCache = execSync(`find "${__dirname}" -type d -name "chrome*" 2>/dev/null | head -5`).toString().trim();
+        console.log('Chrome dirs in project:\n', projectCache || '(none)');
+    } catch (_) {}
+
+    // 1. Explicit env var — but VERIFY the file actually exists first
     if (process.env.PUPPETEER_EXECUTABLE_PATH) {
-        console.log('✅ Chrome from env:', process.env.PUPPETEER_EXECUTABLE_PATH);
-        return process.env.PUPPETEER_EXECUTABLE_PATH;
+        const envPath = process.env.PUPPETEER_EXECUTABLE_PATH;
+        if (fs.existsSync(envPath)) {
+            console.log('✅ Using verified env path:', envPath);
+            return envPath;
+        } else {
+            console.warn('⚠️  Env var path does NOT exist on disk:', envPath, '— ignoring it');
+        }
     }
 
-    // 2. Search relative to the project directory first (where 'npm run build' installs it)
-    //    Render sets __dirname to /opt/render/project/src
-    const projectCacheDir = path.join(__dirname, '.cache', 'puppeteer');
-    console.log('🔍 Searching project cache:', projectCacheDir);
-    if (fs.existsSync(projectCacheDir)) {
-        try {
-            const found = execSync(
-                `find "${projectCacheDir}" -name "chrome" -type f 2>/dev/null | head -1`
-            ).toString().trim();
-            if (found) { console.log('✅ Chrome found at:', found); return found; }
-        } catch (_) {}
+    // 2. Project-local cache (where `npx puppeteer browsers install chrome` puts it
+    //    when run from the project dir during build)
+    const projectCacheDirs = [
+        path.join(__dirname, '.cache', 'puppeteer'),
+        path.join(__dirname, 'node_modules', 'puppeteer', '.local-chromium'),
+        path.join(__dirname, 'node_modules', 'puppeteer-core', '.local-chromium'),
+    ];
+    for (const dir of projectCacheDirs) {
+        if (fs.existsSync(dir)) {
+            try {
+                const found = execSync(`find "${dir}" -name "chrome" -type f 2>/dev/null | head -1`).toString().trim();
+                if (found) { console.log('✅ Found in project cache:', found); return found; }
+            } catch (_) {}
+        }
     }
 
-    // 3. Search Render's HOME cache directory
-    const homeCacheDir = path.join(process.env.HOME || '/opt/render', '.cache', 'puppeteer');
-    console.log('🔍 Searching home cache:', homeCacheDir);
-    if (fs.existsSync(homeCacheDir)) {
-        try {
-            const found = execSync(
-                `find "${homeCacheDir}" -name "chrome" -type f 2>/dev/null | head -1`
-            ).toString().trim();
-            if (found) { console.log('✅ Chrome found at:', found); return found; }
-        } catch (_) {}
-    }
-
-    // 4. Broad search under /opt/render (catches any variation)
-    console.log('🔍 Broad search under /opt/render...');
+    // 3. Broad search under the project root
     try {
-        const found = execSync(
-            `find /opt/render -name "chrome" -type f 2>/dev/null | head -1`
-        ).toString().trim();
-        if (found) { console.log('✅ Chrome found at:', found); return found; }
+        const found = execSync(`find "${__dirname}" -name "chrome" -type f 2>/dev/null | head -1`).toString().trim();
+        if (found) { console.log('✅ Found under project root:', found); return found; }
     } catch (_) {}
 
-    // 5. System-installed Chrome fallback
+    // 4. HOME cache
+    const home = process.env.HOME || '/root';
     try {
-        const sys = execSync(
-            'which google-chrome-stable google-chrome chromium-browser chromium 2>/dev/null | head -1'
-        ).toString().trim();
-        if (sys) { console.log('✅ System Chrome at:', sys); return sys; }
+        const found = execSync(`find "${home}" -name "chrome" -type f 2>/dev/null | head -1`).toString().trim();
+        if (found) { console.log('✅ Found under HOME:', found); return found; }
     } catch (_) {}
 
-    console.error('❌ No Chrome found! Make sure your build command includes: npx puppeteer browsers install chrome');
+    // 5. System chrome
+    try {
+        const sys = execSync('which google-chrome-stable google-chrome chromium-browser chromium 2>/dev/null | head -1').toString().trim();
+        if (sys) { console.log('✅ System Chrome:', sys); return sys; }
+    } catch (_) {}
+
+    console.error('❌ Chrome not found anywhere. Build command may not be persisting files.');
     return null;
 }
 
@@ -76,7 +95,13 @@ function findChrome() {
 // ==============================
 
 const chromePath = findChrome();
-console.log('🌐 Using Chrome executable:', chromePath);
+console.log('--- Using Chrome:', chromePath, '---');
+
+if (!chromePath) {
+    console.error('FATAL: No Chrome binary found. Cannot start WhatsApp client.');
+    console.error('Fix: make sure your Render build command is: npm install && npx puppeteer browsers install chrome');
+    process.exit(1);
+}
 
 const client = new Client({
     authStrategy: new LocalAuth(),
@@ -131,15 +156,14 @@ client.initialize();
 // ROUTES
 // ==============================
 
-// Health check
 app.get('/', (req, res) => {
     res.json({
         status: clientReady ? 'ready' : 'waiting',
-        message: clientReady ? '✅ WhatsApp connected!' : '⏳ Waiting for QR scan...'
+        message: clientReady ? '✅ WhatsApp connected!' : '⏳ Waiting for QR scan...',
+        chromePath
     });
 });
 
-// Show QR code page — open this in browser to scan
 app.get('/qr', (req, res) => {
     if (clientReady) {
         return res.send(`
@@ -169,7 +193,6 @@ app.get('/qr', (req, res) => {
     `);
 });
 
-// Send absence notifications — called by Flask app
 app.post('/send-absence', async (req, res) => {
     if (!clientReady) {
         return res.status(503).json({ error: 'WhatsApp not connected yet. Please scan QR first.' });
@@ -186,7 +209,6 @@ app.post('/send-absence', async (req, res) => {
     for (const student of students) {
         if (!student.phone_number) continue;
 
-        // Clean phone number — remove +, spaces, dashes
         const phone = String(student.phone_number).replace(/[^0-9]/g, '');
         const number = phone + '@c.us';
 
@@ -205,7 +227,6 @@ Dojo Management 🥋`;
             await client.sendMessage(number, message);
             console.log(`✅ Sent to ${student.name} (${phone})`);
             results.push({ name: student.name, status: 'sent' });
-            // Small delay between messages to avoid spam detection
             await new Promise(r => setTimeout(r, 1000));
         } catch (err) {
             console.error(`❌ Failed for ${student.name}:`, err.message);
@@ -221,9 +242,6 @@ Dojo Management 🥋`;
     });
 });
 
-// ==============================
-// START SERVER
-// ==============================
 app.listen(PORT, () => {
     console.log(`🌐 WhatsApp service running on port ${PORT}`);
     console.log(`📱 Open /qr to scan QR code`);
