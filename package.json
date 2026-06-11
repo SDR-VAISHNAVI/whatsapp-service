@@ -1,10 +1,10 @@
 {
   "name": "whatsapp-service",
   "version": "1.0.0",
-  "description": "WhatsApp notification service for VRank/BeltBook",
+  "description": "WhatsApp notification service",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
     "build": "npx puppeteer browsers install chrome"
   },
   "dependencies": {
