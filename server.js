@@ -1,7 +1,7 @@
 const express = require('express');
 const QRCode = require('qrcode');
 const { createClient } = require('@supabase/supabase-js');
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
 const { Boom } = require('@hapi/boom');
 const fs = require('fs');
 const path = require('path');
@@ -19,6 +19,7 @@ const supabase = createClient(
 let sock = null;
 let clientReady = false;
 let currentQR = null;
+let isConnecting = false;  // FIX 3: prevent overlapping reconnect calls
 
 // ==============================
 // SUPABASE SESSION STORE
@@ -80,58 +81,107 @@ async function saveSessionToSupabase() {
 // ==============================
 
 async function connectWhatsApp() {
-    await loadSessionFromSupabase();
-    fs.mkdirSync(SESSION_DIR, { recursive: true });
+    // FIX 3: prevent duplicate connections
+    if (isConnecting) {
+        console.log('⚠️ Already connecting, skipping duplicate call');
+        return;
+    }
+    isConnecting = true;
 
-    const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
+    try {
+        await loadSessionFromSupabase();
+        fs.mkdirSync(SESSION_DIR, { recursive: true });
 
-    sock = makeWASocket({
-        auth: state,
-        printQRInTerminal: true,
-        logger: pino({ level: 'silent' }),
-    });
-
-    sock.ev.on('creds.update', async () => {
-        await saveCreds();
-        await saveSessionToSupabase();
-    });
-
-    sock.ev.on('connection.update', async (update) => {
-        const { connection, lastDisconnect, qr } = update;
-
-        if (qr) {
-            console.log('📱 New QR generated');
-            currentQR = await QRCode.toDataURL(qr);
-            clientReady = false;
-        }
-
-        if (connection === 'open') {
-            console.log('✅ WhatsApp connected!');
-            clientReady = true;
-            currentQR = null;
-            await saveSessionToSupabase();
-        }
-
-        if (connection === 'close') {
-            clientReady = false;
-            const shouldReconnect =
-                lastDisconnect?.error instanceof Boom &&
-                lastDisconnect.error.output?.statusCode !== DisconnectReason.loggedOut;
-
-            console.log('⚠️ Connection closed. Reconnecting:', shouldReconnect);
-            if (shouldReconnect) {
-                setTimeout(connectWhatsApp, 5000);
-            } else {
-                console.log('Logged out — clearing session');
-                await supabase
-                    .from('whatsapp_sessions')
-                    .delete()
-                    .eq('id', 'dojo-whatsapp');
-                currentQR = null;
-                setTimeout(connectWhatsApp, 5000);
+        // FIX 1: clear stale/corrupt session files before connecting
+        // If they exist but are broken, Baileys skips QR and fails silently.
+        // We detect this by checking if creds.json is actually valid.
+        const credsPath = path.join(SESSION_DIR, 'creds.json');
+        if (fs.existsSync(credsPath)) {
+            try {
+                const creds = JSON.parse(fs.readFileSync(credsPath, 'utf8'));
+                // If me is missing, session is incomplete — wipe it so QR shows
+                if (!creds.me) {
+                    console.log('⚠️ Incomplete creds.json (no "me" field) — clearing session to force QR');
+                    fs.rmSync(SESSION_DIR, { recursive: true, force: true });
+                    fs.mkdirSync(SESSION_DIR, { recursive: true });
+                }
+            } catch {
+                console.log('⚠️ Corrupt creds.json — clearing session to force QR');
+                fs.rmSync(SESSION_DIR, { recursive: true, force: true });
+                fs.mkdirSync(SESSION_DIR, { recursive: true });
             }
         }
-    });
+
+        const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
+
+        // FIX 2: use warn-level logger (not silent) so Baileys QR events fire reliably
+        const logger = pino({ level: 'warn' });
+
+        // FIX 2: fetch latest WA version to avoid version-mismatch QR failures
+        const { version } = await fetchLatestBaileysVersion();
+        console.log(`Using WA version: ${version.join('.')}`);
+
+        sock = makeWASocket({
+            version,
+            auth: state,
+            printQRInTerminal: true,
+            logger,
+            // FIX 2: browser identity helps avoid QR being skipped by WA servers
+            browser: ['Dojo Bot', 'Chrome', '120.0.0'],
+        });
+
+        sock.ev.on('creds.update', async () => {
+            await saveCreds();
+            await saveSessionToSupabase();
+        });
+
+        sock.ev.on('connection.update', async (update) => {
+            const { connection, lastDisconnect, qr } = update;
+
+            if (qr) {
+                console.log('📱 New QR generated');
+                currentQR = await QRCode.toDataURL(qr);
+                clientReady = false;
+            }
+
+            if (connection === 'open') {
+                console.log('✅ WhatsApp connected!');
+                clientReady = true;
+                currentQR = null;
+                isConnecting = false;
+                await saveSessionToSupabase();
+            }
+
+            if (connection === 'close') {
+                clientReady = false;
+                isConnecting = false;  // allow reconnect
+                const statusCode = lastDisconnect?.error instanceof Boom
+                    ? lastDisconnect.error.output?.statusCode
+                    : null;
+
+                const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+                console.log(`⚠️ Connection closed (code: ${statusCode}). Reconnecting: ${shouldReconnect}`);
+
+                if (shouldReconnect) {
+                    setTimeout(connectWhatsApp, 5000);
+                } else {
+                    console.log('Logged out — clearing session');
+                    fs.rmSync(SESSION_DIR, { recursive: true, force: true });
+                    await supabase
+                        .from('whatsapp_sessions')
+                        .delete()
+                        .eq('id', 'dojo-whatsapp');
+                    currentQR = null;
+                    setTimeout(connectWhatsApp, 5000);
+                }
+            }
+        });
+
+    } catch (err) {
+        console.error('connectWhatsApp error:', err);
+        isConnecting = false;
+        setTimeout(connectWhatsApp, 10000);
+    }
 }
 
 // ==============================
@@ -174,6 +224,20 @@ app.get('/qr', (req, res) => {
     `);
 });
 
+// Endpoint to force re-login (clears session and triggers new QR)
+app.post('/logout', async (req, res) => {
+    clientReady = false;
+    currentQR = null;
+    if (sock) {
+        try { await sock.logout(); } catch {}
+        sock = null;
+    }
+    fs.rmSync(SESSION_DIR, { recursive: true, force: true });
+    await supabase.from('whatsapp_sessions').delete().eq('id', 'dojo-whatsapp');
+    setTimeout(connectWhatsApp, 1000);
+    res.json({ success: true, message: 'Logged out. New QR will appear at /qr shortly.' });
+});
+
 app.post('/send-absence', async (req, res) => {
     if (!clientReady) {
         return res.status(503).json({ error: 'WhatsApp not connected yet. Please scan QR first.' });
@@ -186,7 +250,6 @@ app.post('/send-absence', async (req, res) => {
     for (const student of students) {
         if (!student.phone_number) continue;
         const phone = String(student.phone_number).replace(/[^0-9]/g, '');
-        // Baileys format: countrycode+number@s.whatsapp.net
         const number = phone.startsWith('91') ? phone : '91' + phone;
         const jid = number + '@s.whatsapp.net';
 
@@ -223,8 +286,7 @@ Dojo Management 🥋`;
 // START
 // ==============================
 
-connectWhatsApp();
-
 app.listen(PORT, () => {
     console.log(`🌐 WhatsApp service running on port ${PORT}`);
+    connectWhatsApp();  // FIX 3: start after server is ready
 });
