@@ -14,11 +14,35 @@ let currentQR = null;
 // ==============================
 // WHATSAPP CLIENT
 // ==============================
+const { execSync } = require('child_process');
+
+function findChrome() {
+    // 1. Environment variable (set this in Render dashboard if needed)
+    if (process.env.PUPPETEER_EXECUTABLE_PATH) {
+        return process.env.PUPPETEER_EXECUTABLE_PATH;
+    }
+    // 2. Search Render's puppeteer cache for any chrome binary
+    try {
+        const found = execSync('find /opt/render/.cache/puppeteer -name "chrome" -type f 2>/dev/null | head -1')
+            .toString().trim();
+        if (found) { console.log('✅ Chrome found at:', found); return found; }
+    } catch (_) {}
+    // 3. System chrome
+    try {
+        const sys = execSync('which google-chrome chromium-browser chromium 2>/dev/null | head -1')
+            .toString().trim();
+        if (sys) { console.log('✅ System Chrome at:', sys); return sys; }
+    } catch (_) {}
+
+    console.error('❌ No Chrome found! Run: npx puppeteer browsers install chrome');
+    return null;
+}
+
 const client = new Client({
     authStrategy: new LocalAuth(),
     puppeteer: {
         headless: true,
-        executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '/opt/render/project/src/.cache/puppeteer/chrome/linux-146.0.7680.31/chrome-linux64/chrome',
+        executablePath: findChrome(),
         args: [
             '--no-sandbox',
             '--disable-setuid-sandbox',
@@ -60,20 +84,6 @@ client.on('disconnected', () => {
     clientReady = false;
     client.initialize();
 });
-
-// Debug: find Chrome path
-const { execSync } = require('child_process');
-try {
-    const chromePath = execSync('find /opt/render/.cache/puppeteer -name "chrome" -type f 2>/dev/null').toString().trim();
-    console.log('✅ Chrome found at:', chromePath);
-} catch(e) {
-    try {
-        const sys = execSync('which google-chrome chromium-browser chromium 2>/dev/null').toString().trim();
-        console.log('✅ System Chrome:', sys);
-    } catch(e2) {
-        console.log('❌ No Chrome found!');
-    }
-}
 
 console.log('🚀 Initializing WhatsApp client...');
 client.initialize();
