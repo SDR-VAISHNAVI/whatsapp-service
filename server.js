@@ -61,6 +61,20 @@ client.on('disconnected', () => {
     client.initialize();
 });
 
+// Debug: find Chrome path
+const { execSync } = require('child_process');
+try {
+    const chromePath = execSync('find /opt/render/.cache/puppeteer -name "chrome" -type f 2>/dev/null').toString().trim();
+    console.log('✅ Chrome found at:', chromePath);
+} catch(e) {
+    try {
+        const sys = execSync('which google-chrome chromium-browser chromium 2>/dev/null').toString().trim();
+        console.log('✅ System Chrome:', sys);
+    } catch(e2) {
+        console.log('❌ No Chrome found!');
+    }
+}
+
 console.log('🚀 Initializing WhatsApp client...');
 client.initialize();
 
