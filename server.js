@@ -1,292 +1,283 @@
-const express = require('express');
-const QRCode = require('qrcode');
+const express  = require('express');
+const QRCode   = require('qrcode');
 const { createClient } = require('@supabase/supabase-js');
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
+const {
+    default: makeWASocket,
+    useMultiFileAuthState,
+    DisconnectReason,
+    fetchLatestBaileysVersion
+} = require('@whiskeysockets/baileys');
 const { Boom } = require('@hapi/boom');
-const fs = require('fs');
+const fs   = require('fs');
 const path = require('path');
 const pino = require('pino');
 
-const app = express();
+const app  = express();
 app.use(express.json());
 
-const PORT = process.env.PORT || 3000;
+const PORT     = process.env.PORT || 3000;
 const supabase = createClient(
     process.env.SUPABASE_URL,
     process.env.SUPABASE_SERVICE_KEY
 );
 
-let sock = null;
-let clientReady = false;
-let currentQR = null;
-let isConnecting = false;  // FIX 3: prevent overlapping reconnect calls
+// ── Per-owner runtime state ────────────────────────────────
+// Map<owner_id_string, { sock, ready, qr, connecting }>
+const ownerSessions = new Map();
 
-// ==============================
-// SUPABASE SESSION STORE
-// ==============================
+function getState(ownerId) {
+    const key = String(ownerId);
+    if (!ownerSessions.has(key)) {
+        ownerSessions.set(key, { sock: null, ready: false, qr: null, connecting: false });
+    }
+    return ownerSessions.get(key);
+}
 
-const SESSION_DIR = '/tmp/whatsapp-session';
+// ── Session dir per owner ─────────────────────────────────
+function sessionDir(ownerId) {
+    const dir = path.join('/tmp', `wa-session-${ownerId}`);
+    fs.mkdirSync(dir, { recursive: true });
+    return dir;
+}
 
-async function loadSessionFromSupabase() {
+// ── Supabase session load/save ────────────────────────────
+async function loadSession(ownerId) {
+    const { data, error } = await supabase
+        .from('whatsapp_sessions')
+        .select('session')
+        .eq('owner_id', ownerId)
+        .single();
+    if (error || !data) return;
     try {
-        const { data, error } = await supabase
-            .from('whatsapp_sessions')
-            .select('session')
-            .eq('id', 'dojo-whatsapp')
-            .single();
-        if (error || !data) {
-            console.log('No session found in Supabase, starting fresh');
-            return;
+        const dir   = sessionDir(ownerId);
+        const files = JSON.parse(data.session);
+        for (const [file, content] of Object.entries(files)) {
+            fs.writeFileSync(path.join(dir, file), JSON.stringify(content));
         }
-        fs.mkdirSync(SESSION_DIR, { recursive: true });
-        const sessionData = JSON.parse(data.session);
-        for (const [filename, content] of Object.entries(sessionData)) {
-            fs.writeFileSync(
-                path.join(SESSION_DIR, filename),
-                JSON.stringify(content)
-            );
-        }
-        console.log('✅ Session loaded from Supabase');
+        console.log(`[owner:${ownerId}] ✅ session loaded`);
     } catch (e) {
-        console.error('Error loading session:', e);
+        console.error(`[owner:${ownerId}] load error:`, e.message);
     }
 }
 
-async function saveSessionToSupabase() {
+async function saveSession(ownerId) {
     try {
-        if (!fs.existsSync(SESSION_DIR)) return;
-        const files = fs.readdirSync(SESSION_DIR);
-        const sessionData = {};
-        for (const file of files) {
-            const content = fs.readFileSync(path.join(SESSION_DIR, file), 'utf8');
-            try { sessionData[file] = JSON.parse(content); }
-            catch { sessionData[file] = content; }
+        const dir = sessionDir(ownerId);
+        if (!fs.existsSync(dir)) return;
+        const files = {};
+        for (const file of fs.readdirSync(dir)) {
+            const raw = fs.readFileSync(path.join(dir, file), 'utf8');
+            try { files[file] = JSON.parse(raw); } catch { files[file] = raw; }
         }
-        const { error } = await supabase
-            .from('whatsapp_sessions')
-            .upsert({
-                id: 'dojo-whatsapp',
-                session: JSON.stringify(sessionData),
-                updated_at: new Date().toISOString()
-            });
+        const { error } = await supabase.from('whatsapp_sessions').upsert({
+            owner_id:   ownerId,
+            session:    JSON.stringify(files),
+            updated_at: new Date().toISOString()
+        }, { onConflict: 'owner_id' });
         if (error) throw error;
-        console.log('✅ Session saved to Supabase');
+        console.log(`[owner:${ownerId}] ✅ session saved`);
     } catch (e) {
-        console.error('Error saving session:', e);
+        console.error(`[owner:${ownerId}] save error:`, e.message);
     }
 }
 
-// ==============================
-// WHATSAPP CONNECTION
-// ==============================
+async function clearSession(ownerId) {
+    const dir = sessionDir(ownerId);
+    if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
+    await supabase.from('whatsapp_sessions').delete().eq('owner_id', ownerId);
+}
 
-async function connectWhatsApp() {
-    // FIX 3: prevent duplicate connections
-    if (isConnecting) {
-        console.log('⚠️ Already connecting, skipping duplicate call');
-        return;
-    }
-    isConnecting = true;
+// ── Core connect function ─────────────────────────────────
+async function connectOwner(ownerId) {
+    const state = getState(ownerId);
+    if (state.connecting) return;
+    state.connecting = true;
 
     try {
-        await loadSessionFromSupabase();
-        fs.mkdirSync(SESSION_DIR, { recursive: true });
+        await loadSession(ownerId);
+        const dir = sessionDir(ownerId);
 
-        // FIX 1: clear stale/corrupt session files before connecting
-        // If they exist but are broken, Baileys skips QR and fails silently.
-        // We detect this by checking if creds.json is actually valid.
-        const credsPath = path.join(SESSION_DIR, 'creds.json');
+        // Validate creds
+        const credsPath = path.join(dir, 'creds.json');
         if (fs.existsSync(credsPath)) {
             try {
                 const creds = JSON.parse(fs.readFileSync(credsPath, 'utf8'));
-                // If me is missing, session is incomplete — wipe it so QR shows
                 if (!creds.me) {
-                    console.log('⚠️ Incomplete creds.json (no "me" field) — clearing session to force QR');
-                    fs.rmSync(SESSION_DIR, { recursive: true, force: true });
-                    fs.mkdirSync(SESSION_DIR, { recursive: true });
+                    console.log(`[owner:${ownerId}] incomplete creds — clearing`);
+                    fs.rmSync(dir, { recursive: true, force: true });
+                    fs.mkdirSync(dir, { recursive: true });
                 }
             } catch {
-                console.log('⚠️ Corrupt creds.json — clearing session to force QR');
-                fs.rmSync(SESSION_DIR, { recursive: true, force: true });
-                fs.mkdirSync(SESSION_DIR, { recursive: true });
+                console.log(`[owner:${ownerId}] corrupt creds — clearing`);
+                fs.rmSync(dir, { recursive: true, force: true });
+                fs.mkdirSync(dir, { recursive: true });
             }
         }
 
-        const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
-
-        // FIX 2: use warn-level logger (not silent) so Baileys QR events fire reliably
-        const logger = pino({ level: 'warn' });
-
-        // FIX 2: fetch latest WA version to avoid version-mismatch QR failures
+        const { state: authState, saveCreds } = await useMultiFileAuthState(dir);
         const { version } = await fetchLatestBaileysVersion();
-        console.log(`Using WA version: ${version.join('.')}`);
 
-        sock = makeWASocket({
+        const sock = makeWASocket({
             version,
-            auth: state,
+            auth:              authState,
             printQRInTerminal: true,
-            logger,
-            // FIX 2: browser identity helps avoid QR being skipped by WA servers
-            browser: ['Dojo Bot', 'Chrome', '120.0.0'],
+            logger:            pino({ level: 'warn' }),
+            browser:           ['BeltBook', 'Chrome', '120.0.0'],
         });
+
+        state.sock = sock;
 
         sock.ev.on('creds.update', async () => {
             await saveCreds();
-            await saveSessionToSupabase();
+            await saveSession(ownerId);
         });
 
         sock.ev.on('connection.update', async (update) => {
             const { connection, lastDisconnect, qr } = update;
 
             if (qr) {
-                console.log('📱 New QR generated');
-                currentQR = await QRCode.toDataURL(qr);
-                clientReady = false;
+                state.qr    = await QRCode.toDataURL(qr);
+                state.ready = false;
+                console.log(`[owner:${ownerId}] QR generated`);
             }
 
             if (connection === 'open') {
-                console.log('✅ WhatsApp connected!');
-                clientReady = true;
-                currentQR = null;
-                isConnecting = false;
-                await saveSessionToSupabase();
+                state.ready      = true;
+                state.qr         = null;
+                state.connecting = false;
+                await saveSession(ownerId);
+                console.log(`[owner:${ownerId}] ✅ connected`);
             }
 
             if (connection === 'close') {
-                clientReady = false;
-                isConnecting = false;  // allow reconnect
-                const statusCode = lastDisconnect?.error instanceof Boom
-                    ? lastDisconnect.error.output?.statusCode
-                    : null;
-
-                const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-                console.log(`⚠️ Connection closed (code: ${statusCode}). Reconnecting: ${shouldReconnect}`);
-
-                if (shouldReconnect) {
-                    setTimeout(connectWhatsApp, 5000);
+                state.ready      = false;
+                state.connecting = false;
+                const code = lastDisconnect?.error instanceof Boom
+                    ? lastDisconnect.error.output?.statusCode : null;
+                const reconnect = code !== DisconnectReason.loggedOut;
+                console.log(`[owner:${ownerId}] closed (${code}). reconnect=${reconnect}`);
+                if (reconnect) {
+                    setTimeout(() => connectOwner(ownerId), 5000);
                 } else {
-                    console.log('Logged out — clearing session');
-                    fs.rmSync(SESSION_DIR, { recursive: true, force: true });
-                    await supabase
-                        .from('whatsapp_sessions')
-                        .delete()
-                        .eq('id', 'dojo-whatsapp');
-                    currentQR = null;
-                    setTimeout(connectWhatsApp, 5000);
+                    await clearSession(ownerId);
+                    state.qr   = null;
+                    state.sock = null;
+                    setTimeout(() => connectOwner(ownerId), 5000);
                 }
             }
         });
 
     } catch (err) {
-        console.error('connectWhatsApp error:', err);
-        isConnecting = false;
-        setTimeout(connectWhatsApp, 10000);
+        console.error(`[owner:${ownerId}] connect error:`, err.message);
+        state.connecting = false;
+        setTimeout(() => connectOwner(ownerId), 10000);
     }
 }
 
-// ==============================
-// ROUTES
-// ==============================
+// ── Helper: validate owner_id ─────────────────────────────
+function parseOwner(req) {
+    const id = parseInt(req.query.owner_id || req.body?.owner_id);
+    if (!id || isNaN(id)) return null;
+    return id;
+}
 
-app.get('/', (req, res) => {
-    res.json({
-        status: clientReady ? 'ready' : 'waiting',
-        message: clientReady ? '✅ WhatsApp connected!' : '⏳ Waiting for QR scan...'
-    });
+// ── ROUTES ────────────────────────────────────────────────
+
+// Status check — called from Flask /api/whatsapp/status
+app.get('/status', (req, res) => {
+    const ownerId = parseOwner(req);
+    if (!ownerId) return res.status(400).json({ error: 'owner_id required' });
+    const state = getState(ownerId);
+    res.json({ connected: state.ready, has_qr: !!state.qr });
 });
 
-app.get('/qr', (req, res) => {
-    if (clientReady) {
-        return res.send(`
-            <html><body style="background:#111;color:#fff;font-family:sans-serif;text-align:center;padding:40px;">
-                <h2 style="color:#00e676;">✅ WhatsApp Already Connected!</h2>
-                <p>No need to scan QR. Service is running.</p>
-            </body></html>
-        `);
-    }
-    if (!currentQR) {
-        return res.send(`
-            <html><body style="background:#111;color:#fff;font-family:sans-serif;text-align:center;padding:40px;">
-                <h2>⏳ Generating QR Code...</h2>
-                <p>Please wait and refresh in 10 seconds.</p>
-                <script>setTimeout(() => location.reload(), 5000);</script>
-            </body></html>
-        `);
-    }
-    res.send(`
-        <html><body style="background:#111;color:#fff;font-family:sans-serif;text-align:center;padding:40px;">
-            <h2 style="color:#00c8ff;">📱 Scan QR Code with WhatsApp</h2>
-            <p>Open WhatsApp → Settings → Linked Devices → Link a Device</p>
-            <img src="${currentQR}" style="margin:20px auto;display:block;border:4px solid #fff;border-radius:12px;"/>
-            <p style="color:#888;">Page auto-refreshes every 10 seconds</p>
-            <script>setTimeout(() => location.reload(), 10000);</script>
-        </body></html>
-    `);
+// QR data — called from Flask /api/whatsapp/qr
+app.get('/qr-data', (req, res) => {
+    const ownerId = parseOwner(req);
+    if (!ownerId) return res.status(400).json({ error: 'owner_id required' });
+    const state = getState(ownerId);
+    if (state.ready) return res.json({ connected: true });
+    if (!state.qr)   return res.json({ connected: false, qr: null, message: 'Generating QR…' });
+    res.json({ connected: false, qr: state.qr });
 });
 
-// Endpoint to force re-login (clears session and triggers new QR)
+// Connect (start session for owner) — called from frontend
+app.post('/connect', (req, res) => {
+    const ownerId = parseOwner(req);
+    if (!ownerId) return res.status(400).json({ error: 'owner_id required' });
+    const state = getState(ownerId);
+    if (!state.ready && !state.connecting) {
+        connectOwner(ownerId);
+    }
+    res.json({ started: true });
+});
+
+// Logout (clear session for owner)
 app.post('/logout', async (req, res) => {
-    clientReady = false;
-    currentQR = null;
-    if (sock) {
-        try { await sock.logout(); } catch {}
-        sock = null;
+    const ownerId = parseOwner(req);
+    if (!ownerId) return res.status(400).json({ error: 'owner_id required' });
+    const state = getState(ownerId);
+    state.ready = false; state.qr = null;
+    if (state.sock) {
+        try { await state.sock.logout(); } catch {}
+        state.sock = null;
     }
-    fs.rmSync(SESSION_DIR, { recursive: true, force: true });
-    await supabase.from('whatsapp_sessions').delete().eq('id', 'dojo-whatsapp');
-    setTimeout(connectWhatsApp, 1000);
-    res.json({ success: true, message: 'Logged out. New QR will appear at /qr shortly.' });
+    await clearSession(ownerId);
+    setTimeout(() => connectOwner(ownerId), 1000);
+    res.json({ success: true });
 });
 
+// Send absence messages
 app.post('/send-absence', async (req, res) => {
-    if (!clientReady) {
-        return res.status(503).json({ error: 'WhatsApp not connected yet. Please scan QR first.' });
+    const { owner_id, students, date } = req.body;
+    const ownerId = parseInt(owner_id);
+    if (!ownerId) return res.status(400).json({ error: 'owner_id required' });
+
+    const state = getState(ownerId);
+    if (!state.ready) {
+        return res.status(503).json({ error: 'WhatsApp not connected. Scan QR first.' });
     }
-    const { students, date } = req.body;
-    if (!students || !students.length) {
-        return res.json({ success: true, sent: 0, message: 'No absent students' });
+    if (!students?.length) {
+        return res.json({ success: true, sent: 0, failed: 0, results: [] });
     }
+
     const results = [];
     for (const student of students) {
         if (!student.phone_number) continue;
-        const phone = String(student.phone_number).replace(/[^0-9]/g, '');
+        const phone  = String(student.phone_number).replace(/[^0-9]/g, '');
         const number = phone.startsWith('91') ? phone : '91' + phone;
-        const jid = number + '@s.whatsapp.net';
-
-        const message =
-`🥋 *Dojo Attendance Alert*
+        const jid    = number + '@s.whatsapp.net';
+        const msg    =
+`🥋 *Belt Book — Absence Alert*
 
 Dear Parent,
 Your ward *${student.name}* was absent for today's karate class on *${date}*.
 
-Please ensure regular attendance to maintain progress.
+Please ensure regular attendance to maintain belt progression.
 
 Regards,
-Dojo Management 🥋`;
-
+Dojo Management 🏯`;
         try {
-            await sock.sendMessage(jid, { text: message });
-            console.log(`✅ Sent to ${student.name} (${phone})`);
+            await state.sock.sendMessage(jid, { text: msg });
             results.push({ name: student.name, status: 'sent' });
             await new Promise(r => setTimeout(r, 1000));
         } catch (err) {
-            console.error(`❌ Failed for ${student.name}:`, err.message);
             results.push({ name: student.name, status: 'failed', error: err.message });
         }
     }
     res.json({
         success: true,
-        sent: results.filter(r => r.status === 'sent').length,
-        failed: results.filter(r => r.status === 'failed').length,
+        sent:    results.filter(r => r.status === 'sent').length,
+        failed:  results.filter(r => r.status === 'failed').length,
         results
     });
 });
 
-// ==============================
-// START
-// ==============================
+// Health
+app.get('/', (req, res) => res.json({ service: 'BeltBook WhatsApp', status: 'ok' }));
 
+// ── START ─────────────────────────────────────────────────
 app.listen(PORT, () => {
-    console.log(`🌐 WhatsApp service running on port ${PORT}`);
-    connectWhatsApp();  // FIX 3: start after server is ready
+    console.log(`🌐 WhatsApp service on port ${PORT}`);
+    // Don't auto-connect here — owners connect on-demand from the UI
 });
